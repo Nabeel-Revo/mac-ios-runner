@@ -1,0 +1,55 @@
+#!/bin/bash
+# Control the isolated iOS runner.
+# Usage: runnerctl on|off|status|log|logs|screen on|off|priority standard|low
+KIT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$KIT_DIR/lib.sh"
+WAITER=mac-ios-runner-restart-waiter
+
+case "${1:-status}" in
+  on)  sudo launchctl enable system/$LABEL && sudo launchctl bootstrap system "$PLIST" && echo "on" ;;
+  off) sudo launchctl bootout system/$LABEL 2>/dev/null; sudo launchctl disable system/$LABEL
+       notify "Off" "Runner switched off"; echo "off" ;;
+  status)
+    if pgrep -u "$RUNNER_USER" -f Runner.Listener >/dev/null; then echo "ON"; else echo "OFF"; fi
+    tail -n 5 "$LOG" 2>/dev/null ;;
+  log) tail -f "$LOG" ;;
+
+  logs)
+    # Aligned, readable copy of each month's job log (the .tsv stays the raw data).
+    D="$KIT_DIR/logs"
+    for f in "$D"/*.tsv; do [ -e "$f" ] && column -t -s $'\t' "$f" > "${f%.tsv}.txt"; done
+    open -a TextEdit "$D/$(date +%Y-%m).txt" 2>/dev/null || open "$D" ;;
+
+  screen)
+    # Keep the display on while a job runs (the notifier already keeps the Mac itself awake).
+    mkdir -p "$STATE"; F="$STATE/keep-screen-on"
+    case "${2:-}" in
+      on)  touch "$F"
+           W=$(pgrep -u "$RUNNER_USER" -f Runner.Worker | head -1)
+           { [ -n "$W" ] && ! pgrep -f "^caffeinate -d -w" >/dev/null && nohup caffeinate -d -w "$W"; } >/dev/null 2>&1 &
+           notify "Screen" "Stays on during jobs" ;;
+      off) rm -f "$F"; pkill -f "^caffeinate -d -w"; notify "Screen" "Can sleep during jobs" ;;
+      *) echo "usage: runnerctl screen on|off"; exit 1 ;;
+    esac ;;
+
+  priority)
+    # A running process's priority can't be changed (launchd's background mode sticks),
+    # so save the choice and restart the runner when no job is running.
+    case "${2:-}" in
+      standard) T=Standard; NAME=Standard ;;
+      low)      T=Background; NAME=Low ;;
+      *) echo "usage: runnerctl priority standard|low"; exit 1 ;;
+    esac
+    sudo plutil -replace ProcessType -string "$T" "$PLIST" || exit 1
+    if ! pgrep -u "$RUNNER_USER" -f Runner.Listener >/dev/null; then
+      notify "Priority" "$NAME saved (applies when turned on)"; echo "saved: $NAME"; exit 0
+    fi
+    pgrep -u "$RUNNER_USER" -f Runner.Worker >/dev/null && BUSY=1 || BUSY=0
+    sudo pkill -f "$WAITER"   # only the latest choice keeps a pending restart
+    # shortcut: a job assigned in the few seconds between "job finished" and this restart gets cancelled; rare, re-run it.
+    sudo nohup sh -c ": $WAITER; while pgrep -u $RUNNER_USER -f Runner.Worker >/dev/null; do sleep 15; done; launchctl bootout system/$LABEL; launchctl bootstrap system $PLIST" >/dev/null 2>&1 &
+    if [ "$BUSY" = 1 ]; then notify "Priority" "$NAME saved, applies when the current job finishes"; echo "pending: $NAME"
+    else notify "Priority" "Set to $NAME"; echo "priority: $NAME"; fi ;;
+
+  *) echo "usage: runnerctl on|off|status|log|logs|screen on|off|priority standard|low"; exit 1 ;;
+esac

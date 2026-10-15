@@ -1,0 +1,5 @@
+# Per-machine settings and runtime state — never commit
+config.env
+logs/
+state/
+.DS_Store
